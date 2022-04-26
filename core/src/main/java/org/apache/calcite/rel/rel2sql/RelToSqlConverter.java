@@ -99,15 +99,16 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -264,7 +265,7 @@ public class RelToSqlConverter extends SqlImplementor
     if (fromPart.getKind() == SqlKind.SELECT) {
       existsSqlSelect = (SqlSelect) fromPart;
       existsSqlSelect.setSelectList(
-          new SqlNodeList(ImmutableList.of(SqlLiteral.createExactNumeric("1", POS)), POS));
+          new SqlNodeList(ImmutableList.of(ONE), POS));
       if (existsSqlSelect.getWhere() != null) {
         sqlCondition = SqlStdOperatorTable.AND.createCall(POS,
             existsSqlSelect.getWhere(),
@@ -275,7 +276,7 @@ public class RelToSqlConverter extends SqlImplementor
       existsSqlSelect =
           new SqlSelect(POS, null,
               new SqlNodeList(
-                  ImmutableList.of(SqlLiteral.createExactNumeric("1", POS)), POS),
+                  ImmutableList.of(ONE), POS),
               fromPart, sqlCondition, null,
               null, null, null, null, null, null);
     }
@@ -415,7 +416,9 @@ public class RelToSqlConverter extends SqlImplementor
           ImmutableSet.of(Clause.HAVING));
       parseCorrelTable(e, x);
       final Builder builder = x.builder(e);
-      builder.setHaving(builder.context.toSql(null, e.getCondition()));
+      x.asSelect().setHaving(
+          SqlUtil.andExpressions(x.asSelect().getHaving(),
+              builder.context.toSql(null, e.getCondition())));
       return builder.result();
     } else {
       final Result x = visitInput(e, 0, Clause.WHERE);
@@ -428,7 +431,13 @@ public class RelToSqlConverter extends SqlImplementor
 
   /** Visits a Project; called by {@link #dispatch} via reflection. */
   public Result visit(Project e) {
-    final Result x = visitInput(e, 0, Clause.SELECT);
+    // If the input is a Sort, wrap SELECT is not required.
+    final Result x;
+    if (e.getInput() instanceof Sort) {
+      x = visitInput(e, 0);
+    } else {
+      x = visitInput(e, 0, Clause.SELECT);
+    }
     parseCorrelTable(e, x);
     final Builder builder = x.builder(e);
     if (!isStar(e.getProjects(), e.getInput().getRowType(), e.getRowType())) {
@@ -496,10 +505,16 @@ public class RelToSqlConverter extends SqlImplementor
 
   private Builder visitAggregate(Aggregate e, List<Integer> groupKeyList,
       Clause... clauses) {
+    // groupSet contains at least one column that is not in any groupSet.
+    // Set of clauses that we expect the builder need to add extra Clause.HAVING
+    // then can add Having filter condition in buildAggregate.
+    final Set<Clause> clauseSet = new TreeSet<>(Arrays.asList(clauses));
+    if (!e.getGroupSet().equals(ImmutableBitSet.union(e.getGroupSets()))) {
+      clauseSet.add(Clause.HAVING);
+    }
     // "select a, b, sum(x) from ( ... ) group by a, b"
     final boolean ignoreClauses = e.getInput() instanceof Project;
-    final Result x = visitInput(e, 0, isAnon(), ignoreClauses,
-        ImmutableSet.copyOf(clauses));
+    final Result x = visitInput(e, 0, isAnon(), ignoreClauses, clauseSet);
     final Builder builder = x.builder(e);
     final List<SqlNode> selectList = new ArrayList<>();
     final List<SqlNode> groupByList =
@@ -548,6 +563,21 @@ public class RelToSqlConverter extends SqlImplementor
       // as there is at least one aggregate function.
       builder.setGroupBy(new SqlNodeList(groupByList, POS));
     }
+
+    if (builder.clauses.contains(Clause.HAVING) && !e.getGroupSet()
+        .equals(ImmutableBitSet.union(e.getGroupSets()))) {
+      // groupSet contains at least one column that is not in any groupSets.
+      // To make such columns must appear in the output (their value will
+      // always be NULL), we generate an extra grouping set, then filter
+      // it out using a "HAVING GROUPING(groupSets) <> 0".
+      // We want to generate the
+      final SqlNodeList groupingList = new SqlNodeList(POS);
+      e.getGroupSet().forEach(g ->
+          groupingList.add(builder.context.field(g)));
+      builder.setHaving(
+          SqlStdOperatorTable.NOT_EQUALS.createCall(POS,
+              SqlStdOperatorTable.GROUPING.createCall(groupingList), ZERO));
+    }
     return builder;
   }
 
@@ -590,9 +620,19 @@ public class RelToSqlConverter extends SqlImplementor
           SqlStdOperatorTable.ROLLUP.createCall(SqlParserPos.ZERO, groupKeys));
     default:
     case OTHER:
+      // Make sure that the group sets contains all bits.
+      final List<ImmutableBitSet> groupSets;
+      if (aggregate.getGroupSet()
+          .equals(ImmutableBitSet.union(aggregate.groupSets))) {
+        groupSets = aggregate.getGroupSets();
+      } else {
+        groupSets = new ArrayList<>(aggregate.getGroupSets().size() + 1);
+        groupSets.add(aggregate.getGroupSet());
+        groupSets.addAll(aggregate.getGroupSets());
+      }
       return ImmutableList.of(
           SqlStdOperatorTable.GROUPING_SETS.createCall(SqlParserPos.ZERO,
-              aggregate.getGroupSets().stream()
+              groupSets.stream()
                   .map(groupSet ->
                       groupItem(groupKeys, groupSet, aggregate.getGroupSet()))
                   .collect(Collectors.toList())));
@@ -816,8 +856,7 @@ public class RelToSqlConverter extends SqlImplementor
     // Use condition 1=0 since "where false" does not seem to be supported
     // on some DB vendors.
     return SqlStdOperatorTable.EQUALS.createCall(POS,
-            ImmutableList.of(SqlLiteral.createExactNumeric("1", POS),
-                    SqlLiteral.createExactNumeric("0", POS)));
+        ImmutableList.of(ONE, ZERO));
   }
 
   /** Visits a Sort; called by {@link #dispatch} via reflection. */
@@ -1106,13 +1145,13 @@ public class RelToSqlConverter extends SqlImplementor
     final Context context = tableFunctionScanContext(inputSqlNodes);
     SqlNode callNode = context.toSql(null, e.getCall());
     // Convert to table function call, "TABLE($function_name(xxx))"
-    SqlNode tableCall = new SqlBasicCall(
-        SqlStdOperatorTable.COLLECTION_TABLE,
-        new SqlNode[] {callNode},
-        SqlParserPos.ZERO);
-    SqlNode select = new SqlSelect(
-        SqlParserPos.ZERO, null, SqlNodeList.SINGLETON_STAR, tableCall,
-        null, null, null, null, null, null, null, SqlNodeList.EMPTY);
+    SqlNode tableCall =
+        new SqlBasicCall(SqlStdOperatorTable.COLLECTION_TABLE,
+            ImmutableList.of(callNode), SqlParserPos.ZERO);
+    SqlNode select =
+        new SqlSelect(SqlParserPos.ZERO, null, SqlNodeList.SINGLETON_STAR,
+            tableCall, null, null, null, null, null, null, null,
+            SqlNodeList.EMPTY);
     return result(select, ImmutableList.of(Clause.SELECT), e, null);
   }
 
@@ -1129,7 +1168,7 @@ public class RelToSqlConverter extends SqlImplementor
     result.add(leftOperand);
     result.add(new SqlIdentifier(alias, POS));
     Ord.forEach(rowType.getFieldNames(), (fieldName, i) -> {
-      if (fieldName.toLowerCase(Locale.ROOT).startsWith("expr$")) {
+      if (SqlUtil.isGeneratedAlias(fieldName)) {
         fieldName = "col_" + i;
       }
       result.add(new SqlIdentifier(fieldName, POS));
