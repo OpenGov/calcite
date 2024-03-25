@@ -114,4 +114,8 @@ public class RedshiftSqlDialect extends SqlDialect {
   @Override public boolean supportsAliasedValues() {
     return false;
   }
+
+  @Override public boolean supportsAggregateFunctionFilter() {
+    return false;
+  }
 }
